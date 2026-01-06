@@ -11,11 +11,17 @@ Environment Variables:
     PHONE_AGENT_API_KEY: API key for model authentication (default: EMPTY)
     PHONE_AGENT_MAX_STEPS: Maximum steps per task (default: 100)
     PHONE_AGENT_DEVICE_ID: ADB device ID for multi-device setups
+    PHONE_AGENT_SCAN_PORT: ADB port to scan (default: 5555)
+    PHONE_AGENT_SCAN_TIMEOUT: Socket timeout in seconds for subnet scan (default: 0.5)
+    PHONE_AGENT_SCAN_WORKERS: Worker count for subnet scan (default: 64)
 """
 
 import argparse
+import concurrent.futures
+import ipaddress
 import os
 import shutil
+import socket
 import subprocess
 import sys
 from urllib.parse import urlparse
@@ -32,6 +38,7 @@ from phone_agent.device_factory import DeviceType, get_device_factory, set_devic
 from phone_agent.model import ModelConfig
 from phone_agent.xctest import XCTestConnection
 from phone_agent.xctest import list_devices as list_ios_devices
+from phone_agent.adb.connection import ADBConnection
 
 
 def check_system_requirements(
@@ -269,6 +276,80 @@ def check_system_requirements(
     return all_passed
 
 
+def _is_tcp_port_open(ip: str, port: int, timeout: float) -> bool:
+    """Check if a TCP port is open for the given IP."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        try:
+            return sock.connect_ex((ip, port)) == 0
+        except OSError:
+            return False
+
+
+def scan_subnet_for_adb(
+    subnet: str, port: int = 5555, timeout: float = 0.5, workers: int = 64
+) -> list[str]:
+    """Scan a subnet for hosts with an open ADB TCP port."""
+    network = ipaddress.ip_network(subnet, strict=False)
+    addresses: list[str] = []
+
+    def _check_host(ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str | None:
+        ip_str = str(ip_addr)
+        if _is_tcp_port_open(ip_str, port, timeout):
+            return ip_str
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(_check_host, ip_addr): ip_addr for ip_addr in network.hosts()
+        }
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            if result:
+                addresses.append(result)
+
+    return addresses
+
+
+def scan_and_connect_adb(
+    subnet: str, port: int = 5555, timeout: float = 0.5, workers: int = 64
+) -> list[str]:
+    """Scan a subnet for ADB devices and connect to them."""
+    print(f"🔎 Scanning subnet {subnet} for ADB devices on port {port}...")
+    addresses = scan_subnet_for_adb(subnet, port=port, timeout=timeout, workers=workers)
+    if not addresses:
+        print("No ADB devices found on the subnet.")
+        return []
+
+    conn = ADBConnection()
+    connected: list[str] = []
+    for ip in sorted(addresses):
+        address = f"{ip}:{port}"
+        success, message = conn.connect(address, timeout=int(max(1, timeout * 2)))
+        status_icon = "✓" if success else "✗"
+        print(f"  {status_icon} {address} - {message}")
+        if success:
+            connected.append(address)
+
+    return connected
+
+
+def resolve_target_device_ids(
+    args: argparse.Namespace,
+    device_factory,
+    discovered_device_ids: list[str] | None = None,
+) -> list[str]:
+    """Resolve device IDs for multi-device execution."""
+    if args.device_id:
+        return [args.device_id]
+
+    if discovered_device_ids:
+        return discovered_device_ids
+
+    devices = device_factory.list_devices()
+    return [device.device_id for device in devices if device.status == "device"]
+
+
 def check_model_api(base_url: str, model_name: str, api_key: str = "EMPTY") -> bool:
     """
     Check if the model API is accessible and the specified model exists.
@@ -445,6 +526,40 @@ Examples:
         type=str,
         metavar="ADDRESS",
         help="Connect to remote device (e.g., 192.168.1.100:5555)",
+    )
+
+    parser.add_argument(
+        "--scan-subnet",
+        type=str,
+        metavar="CIDR",
+        help="Scan subnet for ADB devices (e.g., 192.168.1.0/24)",
+    )
+
+    parser.add_argument(
+        "--scan-port",
+        type=int,
+        default=int(os.getenv("PHONE_AGENT_SCAN_PORT", "5555")),
+        help="ADB port to scan for (default: 5555)",
+    )
+
+    parser.add_argument(
+        "--scan-timeout",
+        type=float,
+        default=float(os.getenv("PHONE_AGENT_SCAN_TIMEOUT", "0.5")),
+        help="Socket timeout (seconds) for subnet scan (default: 0.5)",
+    )
+
+    parser.add_argument(
+        "--scan-workers",
+        type=int,
+        default=int(os.getenv("PHONE_AGENT_SCAN_WORKERS", "64")),
+        help="Worker count for subnet scan (default: 64)",
+    )
+
+    parser.add_argument(
+        "--broadcast-task",
+        action="store_true",
+        help="Run the same task across all connected devices",
     )
 
     parser.add_argument(
@@ -684,6 +799,7 @@ def handle_device_commands(args) -> bool:
 def main():
     """Main entry point."""
     args = parse_args()
+    discovered_device_ids: list[str] = []
 
     # Set device type globally based on args
     if args.device_type == "adb":
@@ -702,6 +818,18 @@ def main():
         from phone_agent.hdc import set_hdc_verbose
 
         set_hdc_verbose(True)
+
+    # Scan subnet for ADB devices if requested
+    if args.scan_subnet:
+        if device_type != DeviceType.ADB:
+            print("Error: --scan-subnet is only supported for ADB devices.")
+            sys.exit(2)
+        discovered_device_ids = scan_and_connect_adb(
+            args.scan_subnet,
+            port=args.scan_port,
+            timeout=args.scan_timeout,
+            workers=args.scan_workers,
+        )
 
     # Handle --list-apps (no system check needed)
     if args.list_apps:
@@ -767,6 +895,52 @@ def main():
             agent_config=agent_config,
         )
     else:
+        if args.broadcast_task and device_type != DeviceType.ADB:
+            print("Error: --broadcast-task is only supported for ADB devices.")
+            sys.exit(2)
+
+        if args.broadcast_task and not args.task:
+            print("Error: --broadcast-task requires a task argument.")
+            sys.exit(2)
+
+        if args.broadcast_task:
+            device_factory = get_device_factory()
+            device_ids = resolve_target_device_ids(
+                args, device_factory, discovered_device_ids
+            )
+            if not device_ids:
+                print("Error: No connected ADB devices found for broadcast task.")
+                sys.exit(1)
+
+            print("=" * 50)
+            print("Phone Agent - AI-powered phone automation (broadcast)")
+            print("=" * 50)
+            print(f"Model: {model_config.model_name}")
+            print(f"Base URL: {model_config.base_url}")
+            print(f"Max Steps: {args.max_steps}")
+            print(f"Language: {args.lang}")
+            print(f"Device Type: {args.device_type.upper()}")
+            print(f"Devices: {', '.join(device_ids)}")
+            print("=" * 50)
+
+            print(f"\nTask: {args.task}\n")
+            for device_id in device_ids:
+                print("-" * 50)
+                print(f"Device: {device_id}")
+                broadcast_config = AgentConfig(
+                    max_steps=args.max_steps,
+                    device_id=device_id,
+                    verbose=not args.quiet,
+                    lang=args.lang,
+                )
+                broadcast_agent = PhoneAgent(
+                    model_config=model_config,
+                    agent_config=broadcast_config,
+                )
+                result = broadcast_agent.run(args.task)
+                print(f"\nResult: {result}\n")
+            return
+
         # Create Android/HarmonyOS agent
         agent_config = AgentConfig(
             max_steps=args.max_steps,
