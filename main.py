@@ -42,7 +42,9 @@ from phone_agent.adb.connection import ADBConnection
 
 
 def check_system_requirements(
-    device_type: DeviceType = DeviceType.ADB, wda_url: str = "http://localhost:8100"
+    device_type: DeviceType = DeviceType.ADB,
+    wda_url: str = "http://localhost:8100",
+    device_id: str | None = None,
 ) -> bool:
     """
     Check system requirements before running the agent.
@@ -56,6 +58,7 @@ def check_system_requirements(
     Args:
         device_type: Type of device tool (ADB, HDC, or IOS).
         wda_url: WebDriverAgent URL (for iOS only).
+        device_id: Target device ID (for ADB/HDC; useful when multiple devices are connected).
 
     Returns:
         True if all checks pass, False otherwise.
@@ -141,6 +144,19 @@ def check_system_requirements(
             devices = [
                 line for line in lines[1:] if line.strip() and "\tdevice" in line
             ]
+            if device_id:
+                target_found = any(line.split("\t")[0] == device_id for line in devices)
+                if not target_found:
+                    print("❌ FAILED")
+                    print(
+                        f"   Error: Target device '{device_id}' is not connected (status: device)."
+                    )
+                    print("   Solution:")
+                    print("     1. Verify: adb devices")
+                    print(
+                        f"     2. Reconnect remote device: adb connect {device_id}"
+                    )
+                    all_passed = False
         elif device_type == DeviceType.HDC:
             result = subprocess.run(
                 ["hdc", "list", "targets"], capture_output=True, text=True, timeout=10
@@ -202,8 +218,11 @@ def check_system_requirements(
     if device_type == DeviceType.ADB:
         print("3. Checking ADB Keyboard...", end=" ")
         try:
+            adb_cmd = ["adb"]
+            if device_id:
+                adb_cmd.extend(["-s", device_id])
             result = subprocess.run(
-                ["adb", "shell", "ime", "list", "-s"],
+                [*adb_cmd, "shell", "ime", "list", "-s"],
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -865,6 +884,7 @@ def main():
         wda_url=args.wda_url
         if device_type == DeviceType.IOS
         else "http://localhost:8100",
+        device_id=args.device_id,
     ):
         sys.exit(1)
 
