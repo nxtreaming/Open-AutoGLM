@@ -359,6 +359,26 @@ def resolve_target_device_ids(
     discovered_device_ids: list[str] | None = None,
 ) -> list[str]:
     """Resolve device IDs for multi-device execution."""
+    if getattr(args, "device_ids", None):
+        # Support multiple formats:
+        # - Space separated: --device-ids a b c
+        # - Comma separated: --device-ids a,b,c
+        # - Pipe separated (quote in shells that treat '|' specially): --device-ids "a|b|c"
+        raw_tokens: list[str] = args.device_ids
+        parsed: list[str] = []
+        for token in raw_tokens:
+            for part in token.replace("|", ",").split(","):
+                part = part.strip()
+                if part:
+                    parsed.append(part)
+        # Deduplicate while preserving order
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for d in parsed:
+            if d not in seen:
+                seen.add(d)
+                deduped.append(d)
+        return deduped
     if args.device_id:
         return [args.device_id]
 
@@ -537,6 +557,13 @@ Examples:
         type=str,
         default=os.getenv("PHONE_AGENT_DEVICE_ID"),
         help="ADB device ID",
+    )
+
+    parser.add_argument(
+        "--device-ids",
+        type=str,
+        nargs="+",
+        help="Target device IDs (space/comma/pipe separated). Useful with --broadcast-task to run on a subset of devices.",
     )
 
     parser.add_argument(
