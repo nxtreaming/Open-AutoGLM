@@ -634,6 +634,13 @@ Examples:
     )
 
     parser.add_argument(
+        "--broadcast-workers",
+        type=int,
+        default=1,
+        help="Number of concurrent workers for --broadcast-task (default: 1, sequential)",
+    )
+
+    parser.add_argument(
         "--disconnect",
         type=str,
         nargs="?",
@@ -1004,21 +1011,62 @@ def main():
             print("=" * 50)
 
             print(f"\nTask: {args.task}\n")
-            for device_id in device_ids:
+
+            def _run_on_device(target_device_id: str) -> tuple[str, str | None, str | None]:
+                try:
+                    broadcast_config = AgentConfig(
+                        max_steps=args.max_steps,
+                        device_id=target_device_id,
+                        verbose=not args.quiet,
+                        lang=args.lang,
+                    )
+                    broadcast_agent = PhoneAgent(
+                        model_config=model_config,
+                        agent_config=broadcast_config,
+                    )
+                    result = broadcast_agent.run(args.task)
+                    return target_device_id, str(result), None
+                except Exception as e:
+                    return target_device_id, None, str(e)
+
+            workers = max(1, int(args.broadcast_workers or 1))
+            results: dict[str, tuple[str | None, str | None]] = {}
+
+            if workers == 1:
+                for device_id in device_ids:
+                    print("-" * 50)
+                    print(f"Device: {device_id}")
+                    device_id, result, error = _run_on_device(device_id)
+                    results[device_id] = (result, error)
+                    if error:
+                        print(f"\nError: {error}\n")
+                    else:
+                        print(f"\nResult: {result}\n")
+            else:
+                print(
+                    f"Running broadcast task in parallel with {workers} worker(s). "
+                    f"(Tip: use --quiet to reduce interleaved logs)"
+                )
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                    future_map = {
+                        executor.submit(_run_on_device, device_id): device_id
+                        for device_id in device_ids
+                    }
+                    for future in concurrent.futures.as_completed(future_map):
+                        device_id, result, error = future.result()
+                        results[device_id] = (result, error)
+                        status_icon = "✓" if not error else "✗"
+                        print(f"[{status_icon}] Device: {device_id}")
+
                 print("-" * 50)
-                print(f"Device: {device_id}")
-                broadcast_config = AgentConfig(
-                    max_steps=args.max_steps,
-                    device_id=device_id,
-                    verbose=not args.quiet,
-                    lang=args.lang,
-                )
-                broadcast_agent = PhoneAgent(
-                    model_config=model_config,
-                    agent_config=broadcast_config,
-                )
-                result = broadcast_agent.run(args.task)
-                print(f"\nResult: {result}\n")
+                print("Broadcast summary:")
+                for device_id in device_ids:
+                    result, error = results.get(device_id, (None, "missing result"))
+                    status_icon = "✓" if not error else "✗"
+                    if error:
+                        print(f"  {status_icon} {device_id} - {error}")
+                    else:
+                        print(f"  {status_icon} {device_id} - {result}")
             return
 
         # Create Android/HarmonyOS agent
