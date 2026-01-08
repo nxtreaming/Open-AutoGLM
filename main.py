@@ -45,6 +45,7 @@ def check_system_requirements(
     device_type: DeviceType = DeviceType.ADB,
     wda_url: str = "http://localhost:8100",
     device_id: str | None = None,
+    device_ids: list[str] | None = None,
 ) -> bool:
     """
     Check system requirements before running the agent.
@@ -144,9 +145,22 @@ def check_system_requirements(
             devices = [
                 line for line in lines[1:] if line.strip() and "\tdevice" in line
             ]
-            if device_id:
-                target_found = any(line.split("\t")[0] == device_id for line in devices)
-                if not target_found:
+            connected_ids = [line.split("\t")[0] for line in devices]
+            if device_ids:
+                missing = [d for d in device_ids if d not in connected_ids]
+                if missing:
+                    print("❌ FAILED")
+                    print(
+                        f"   Error: Target device(s) not connected (status: device): {', '.join(missing)}"
+                    )
+                    print("   Solution:")
+                    print("     1. Verify: adb devices")
+                    print(
+                        "     2. Reconnect remote devices: adb connect <ip>:<port>"
+                    )
+                    all_passed = False
+            elif device_id:
+                if device_id not in connected_ids:
                     print("❌ FAILED")
                     print(
                         f"   Error: Target device '{device_id}' is not connected (status: device)."
@@ -218,22 +232,33 @@ def check_system_requirements(
     if device_type == DeviceType.ADB:
         print("3. Checking ADB Keyboard...", end=" ")
         try:
-            adb_cmd = ["adb"]
-            if device_id:
-                adb_cmd.extend(["-s", device_id])
-            result = subprocess.run(
-                [*adb_cmd, "shell", "ime", "list", "-s"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            ime_list = result.stdout.strip()
+            targets = device_ids or ([device_id] if device_id else [])
+            if not targets:
+                targets = [None]
 
-            if "com.android.adbkeyboard/.AdbIME" in ime_list:
+            missing_on: list[str] = []
+            for target in targets:
+                adb_cmd = ["adb"]
+                if target:
+                    adb_cmd.extend(["-s", target])
+                result = subprocess.run(
+                    [*adb_cmd, "shell", "ime", "list", "-s"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                ime_list = result.stdout.strip()
+                if "com.android.adbkeyboard/.AdbIME" not in ime_list:
+                    missing_on.append(target or "<default>")
+
+            if not missing_on:
                 print("✅ OK")
             else:
                 print("❌ FAILED")
-                print("   Error: ADB Keyboard is not installed on the device.")
+                print(
+                    "   Error: ADB Keyboard is not installed (or not visible) on device(s): "
+                    + ", ".join(missing_on)
+                )
                 print("   Solution:")
                 print("     1. Download ADB Keyboard APK from:")
                 print(
@@ -905,6 +930,13 @@ def main():
     if handle_device_commands(args):
         return
 
+    target_device_ids_for_check: list[str] | None = None
+    if device_type == DeviceType.ADB and (args.broadcast_task or getattr(args, "device_ids", None)):
+        device_factory = get_device_factory()
+        target_device_ids_for_check = resolve_target_device_ids(
+            args, device_factory, discovered_device_ids
+        )
+
     # Run system requirements check before proceeding
     if not check_system_requirements(
         device_type,
@@ -912,6 +944,7 @@ def main():
         if device_type == DeviceType.IOS
         else "http://localhost:8100",
         device_id=args.device_id,
+        device_ids=target_device_ids_for_check,
     ):
         sys.exit(1)
 
